@@ -16,6 +16,9 @@ pub enum M2Errors {
 
     #[msg("Time Limit Exceed")]
     TimeLimitExceed,
+
+    #[msg("Not expired")]
+    NotExpired,
 }
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
@@ -44,6 +47,7 @@ pub mod m2 {
         promise.referee = referee;
         promise.timeout = timeout;
         promise.amount = amount;
+        promise.init_amount = amount;
         promise.mint = mint.key();
         promise.beneficiary = ctx.accounts.sender.key();
         let user = &mut ctx.accounts.user;
@@ -113,7 +117,6 @@ pub mod m2 {
         }
         let clock = Clock::get()?;
         let now = clock.unix_timestamp.try_into().unwrap();
-        msg!("now {} vs timeout {}", now, promise.timeout);
         if promise.timeout < now {
             return Err(error!(M2Errors::TimeLimitExceed));
         }
@@ -138,6 +141,36 @@ pub mod m2 {
         token::transfer(cpi_ctx, amount)?;
         Ok(())
     }
+
+    pub fn collect_broken_promises(ctx: Context<CollectFailure>, promise_id: u64) -> Result<()> {
+        let promise = &mut ctx.accounts.promise;
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp.try_into().unwrap();
+        if promise.timeout >= now {
+            return Err(error!(M2Errors::NotExpired));
+        }
+        let beneficiary = &promise.beneficiary;
+        let seeds = &[
+            b"promise_wallet".as_ref(),
+            beneficiary.as_ref(),
+            &promise_id.to_be_bytes(),
+        ];
+        let (_, vault_authority_bump) = Pubkey::find_program_address(seeds, ctx.program_id);
+
+        let mut authority_seeds = seeds.to_vec();
+        let bump_seed = [vault_authority_bump];
+        authority_seeds.push(&bump_seed);
+        let signer = &[&authority_seeds[..]];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.promise_wallet.to_account_info(),
+            to: ctx.accounts.destination_wallet.to_account_info(),
+            authority: ctx.accounts.promise_wallet.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, promise.amount)?;
+        Ok(())
+    }
 }
 
 fn slug_seed(slug: &str) -> &[u8] {
@@ -147,6 +180,24 @@ fn slug_seed(slug: &str) -> &[u8] {
     } else {
         b
     }
+}
+
+#[derive(Accounts)]
+pub struct CollectFailure<'info> {
+    #[account()]
+    pub promise: Account<'info, M2Promise>,
+
+    #[account(mut)]
+    promise_wallet: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    destination_wallet: Account<'info, TokenAccount>,
+
+    #[account(address = token::ID)]
+    pub token_program: Program<'info, Token>,
+
+    #[account(mut)]
+    pub sender: Signer<'info>,
 }
 
 #[derive(Accounts)]
